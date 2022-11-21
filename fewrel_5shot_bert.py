@@ -9,15 +9,13 @@ import json
 import gc
 from tqdm import tqdm
 from sklearn.cluster import KMeans
-from encode import lstm_encoder
-from dataprocess import data_sampler
-from model import proto_softmax_layer
-from dataprocess import get_data_loader
+from encode import bert_encoder,BERTSentenceEncoder
+from dataprocess import data_sampler_bert as data_sampler
+from model import proto_softmax_layer_bert as proto_softmax_layer
+from dataprocess import get_data_loader_bert as get_data_loader
 from transformers import BertTokenizer,BertModel
-from util import set_seed,process_data,getnegfrombatch,select_similar_data_new
+from util import set_seed,getnegfrombatch_bert as getnegfrombatch,process_data,select_similar_data_new_bert
 import faiss
-
-from encode import bert_encoder
 
 def eval_model(config, basemodel, test_set, mem_relations):
     print("One eval")
@@ -28,9 +26,10 @@ def eval_model(config, basemodel, test_set, mem_relations):
     allnum= 0.0
     correctnum = 0.0
     for step, (labels, neg_labels, sentences, firstent, firstentindex, secondent, secondentindex, headid, tailid, rawtext, lengths,
-               typelabels) in enumerate(test_dataloader):
-
-        logits, rep = basemodel(sentences, lengths)
+               typelabels,masks) in enumerate(test_dataloader):
+        sentences=sentences.cuda()
+        masks=masks.cuda()
+        logits, rep = basemodel(sentences, masks)
 
         distances = basemodel.get_mem_feature(rep)
         short_logits = distances
@@ -62,8 +61,10 @@ def get_memory(config, model, proto_set):
     data_loader = get_data_loader(config, memset, False, False)
     features = []
     for step, (labels, neg_labels, sentences, firstent, firstentindex, secondent, secondentindex, headid, tailid, rawtext, lengths,
-               typelabels) in enumerate(data_loader):
-        feature = model.get_feature(sentences, lengths)
+               typelabels, masks) in enumerate(data_loader):
+        sentences=sentences.cuda()
+        masks=masks.cuda()
+        feature = model.get_feature(sentences, masks)
         features.append(feature)
     features = np.concatenate(features)
 
@@ -90,8 +91,10 @@ def select_data(mem_set, proto_memory, config, model, divide_train_set, num_sel_
         data_loader = get_data_loader(config, thisdataset, False, False)
         features = []
         for step, (labels, neg_labels, sentences, firstent, firstentindex, secondent, secondentindex, headid, tailid, rawtext,  lengths,
-                   typelabels) in enumerate(data_loader):
-            feature = model.get_feature(sentences, lengths)
+                   typelabels, masks) in enumerate(data_loader):
+            sentences = sentences.cuda()
+            masks = masks.cuda()
+            feature = model.get_feature(sentences, masks)
             features.append(feature)
         features = np.concatenate(features)
         #print(features.shape)
@@ -187,7 +190,7 @@ def train_model_with_hard_neg(config, model, mem_set, traindata, epochs, current
         lossesfactor4 = 1.0
         lossesfactor5 = 0.1
         for step, (labels, neg_labels, sentences, firstent, firstentindex, secondent, secondentindex, headid, tailid, rawtext, lengths,
-                   typelabels) in enumerate(data_loader):
+                   typelabels, masks) in enumerate(data_loader):
             model.zero_grad()
             #print(len(sentences))
             labels = labels.to(config['device'])
@@ -207,18 +210,22 @@ def train_model_with_hard_neg(config, model, mem_set, traindata, epochs, current
             #print(numofnewtrain)
             getnegfromnum = 1
             allneg = []
-            alllen = []
+            allnegmasks = []
             if numofmem > 0:
                 ###select neg data for mem
                 for oneindex in memindex:
-                    negres,lenres = getnegfrombatch(oneindex,firstent,firstentindex,secondent,secondentindex,sentences,lengths,getnegfromnum,allnum,labels,neg_labels)
+                    negres,negmasks = getnegfrombatch(oneindex,firstent,firstentindex,secondent,secondentindex,sentences,lengths,getnegfromnum,allnum,labels,neg_labels,config)
                     for aa in negres:
-                        allneg.append(torch.tensor(aa))
-                    for aa in lenres:
-                        alllen.append(torch.tensor(aa))
-            sentences.extend(allneg)
-            lengths.extend(alllen)
-            logits, rep = model(sentences, lengths)
+                        allneg.append(aa)
+                    for aa in negmasks:
+                        allnegmasks.append(aa)
+            allneg=torch.tensor(allneg)
+            allnegmasks=torch.tensor(allnegmasks)
+            sentences=torch.cat([sentences,allneg],0).long()
+            masks=torch.cat([masks,allnegmasks],0).long()
+            sentences = sentences.cuda()
+            masks = masks.cuda()
+            logits, rep = model(sentences, masks)
             #print(logits.shape)
             #print(rep.shape)
             logits_proto = model.mem_forward(rep)
@@ -313,9 +320,11 @@ def train_simple_model(config, model, mem_set, train_set, epochs, current_proto,
         lossesfactor4 = 1.0
 
         for step, (labels, neg_labels, sentences, firstent, firstentindex, secondent, secondentindex, headid, tailid, rawtext,
-                   lengths, typelabels) in enumerate(tqdm(data_loader)):
+                   lengths, typelabels, masks) in enumerate(tqdm(data_loader)):
             model.zero_grad()
-            logits, rep = model(sentences, lengths)
+            sentences = sentences.cuda()
+            masks = masks.cuda()
+            logits, rep = model(sentences, masks)
             logits_proto = model.mem_forward(rep)
 
             labels = labels.to(config['device'])
@@ -359,12 +368,10 @@ if __name__ == '__main__':
     config['n_gpu'] = torch.cuda.device_count()
     config['batch_size_per_step'] = int(config['batch_size'] / config["gradient_accumulation_steps"])
     config['neg_sampling'] = False
-
+    config['max_length']=128
     root_path = '.'
-    word2id = json.load(open(os.path.join(root_path, 'glove/word2id.txt')))
-    word2vec = np.load(os.path.join(root_path, 'glove/word2vec.npy'))
-
-    #'''
+    # word2id = json.load(open(os.path.join(root_path, 'glove/word2id.txt')))
+    # word2vec = np.load(os.path.join(root_path, 'glove/word2vec.npy'))
     tokenizer = BertTokenizer.from_pretrained("/home/sjhl/bert-base-uncased")
     donum = 1
 
@@ -378,20 +385,20 @@ if __name__ == '__main__':
     max_sen_lstm_tokenize = 128
     select_thredsold = select_thredsold_param
 
-    # print("********* load from ckpt ***********")
-    # ckptpath = "simmodelckpt"
-    # #ckptpath = "/data/qin/FewShotContinualRE/mycode/newcode/ckpt_of_step_40000"
-    # print(ckptpath)
-    # ckpt = torch.load(ckptpath)
-    # SimModel = BertModel.from_pretrained('/home/sjhl/bert-base-uncased',state_dict=ckpt["bert-base"]).to(config["device"])
-    #
-    # allunlabledata = np.load("allunlabeldata.npy").astype('float32')
-    #
-    # d = 768 * 2
-    # index = faiss.IndexFlatIP(d)
-    # print(index.is_trained)
-    # index.add(allunlabledata)  # add vectors to the index
-    # print(index.ntotal)
+    print("********* load from ckpt ***********")
+    ckptpath = "simmodelckpt"
+    #ckptpath = "/data/qin/FewShotContinualRE/mycode/newcode/ckpt_of_step_40000"
+    print(ckptpath)
+    ckpt = torch.load(ckptpath)
+    SimModel = BertModel.from_pretrained('/home/sjhl/bert-base-uncased',state_dict=ckpt["bert-base"]).to(config["device"])
+
+    allunlabledata = np.load("allunlabeldata.npy").astype('float32')
+
+    d = 768 * 2
+    index = faiss.IndexFlatIP(d)
+    print(index.is_trained)
+    index.add(allunlabledata)  # add vectors to the index
+    print(index.ntotal)
 
     for m in range(donum):
         print('donum:',m)
@@ -400,18 +407,18 @@ if __name__ == '__main__':
         config['valid_file'] = "data/fewrel/CFRLdata_10_100_10_5/valid_" + str(m) + ".txt"
         config['test_file'] = "data/fewrel/CFRLdata_10_100_10_5/test_" + str(m) + ".txt"
 
-        encoderforbase = lstm_encoder(token2id=word2id, word2vec=word2vec, word_size=len(word2vec[0]), max_length=128, pos_size=None,
-                                    hidden_size=config['hidden_size'], dropout=0, bidirectional=True, num_layers=1, config=config)
+        # encoderforbase = lstm_encoder(token2id=word2id, word2vec=word2vec, word_size=len(word2vec[0]), max_length=128, pos_size=None,
+        #                             hidden_size=config['hidden_size'], dropout=0, bidirectional=True, num_layers=1, config=config)
         #
-        # # try bert encoder
-        # config['pretrained_model']="/home/sjhl/bert-base-uncased"
+        # try bert encoder
+        config['pretrained_model']="/home/sjhl/bert-base-uncased"
         # encoderforbase=bert_encoder(config)
-
+        encoderforbase=BERTSentenceEncoder(config)
         sampler = data_sampler(config, encoderforbase.tokenizer)
         modelforbase = proto_softmax_layer(encoderforbase, num_class=len(sampler.id2rel), id2rel=sampler.id2rel, drop=0, config=config)
         modelforbase = modelforbase.to(config["device"])
-
-        word2vec_back = word2vec.copy()
+        #
+        # word2vec_back = word2vec.copy()
 
         sequence_results = []
         result_whole_test = []
@@ -457,16 +464,16 @@ if __name__ == '__main__':
                     divide_train_set[data[0]].append(data)
                 print('divide_train_set:',len(divide_train_set))
 
-                # ####select most similar sentence for new task, not for base task
-                #
-                # ####step==0是base model
+                ####select most similar sentence for new task, not for base task
+
+                ####step==0是base model
                 # if steps == 0:
                 #     ##train base model
                 #     print("train base model,not select most similar")
                 #
                 # else:
                 #     print("train new model,select most similar")
-                #     selectdata = select_similar_data_new(training_data, tokenizer, entpair2scope, topk,
+                #     selectdata = select_similar_data_new_bert(training_data, tokenizer, entpair2scope, topk,
                 #                                             max_sen_length_for_select,list_data, config, SimModel,
                 #                                             select_thredsold,max_sen_lstm_tokenize,encoderforbase.tokenizer,index,ifnorm,select_num)
                 #     print('selected data length:',len(selectdata))
@@ -514,8 +521,9 @@ if __name__ == '__main__':
             gc.collect()
             if config['device'] == 'cuda':
                 torch.cuda.empty_cache()
-            encoderforbase = lstm_encoder(token2id=word2id, word2vec=word2vec_back.copy(), word_size=len(word2vec[0]),max_length=128, pos_size=None,
-                                          hidden_size=config['hidden_size'], dropout=0, bidirectional=True, num_layers=1, config=config)
+            # encoderforbase = bert_encoder(token2id=word2id, word2vec=word2vec_back.copy(), word_size=len(word2vec[0]),max_length=128, pos_size=None,
+            #                               hidden_size=config['hidden_size'], dropout=0, bidirectional=True, num_layers=1, config=config)
+            encoderforbase = bert_encoder(config)
             modelforbase = proto_softmax_layer(encoderforbase, num_class=len(sampler.id2rel), id2rel=sampler.id2rel,
                                                drop=0, config=config)
             modelforbase.to(config["device"])
@@ -528,6 +536,7 @@ if __name__ == '__main__':
             print('')
         avg_result_all_test = np.average(sequence_results, 0)
         for one in avg_result_all_test:
+            sys.stdout.write('final_avg_result!!!')
             sys.stdout.write('%.4f, ' % one)
         print('')
         print("Finish training............................")
