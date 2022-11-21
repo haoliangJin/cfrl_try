@@ -17,8 +17,6 @@ from transformers import BertTokenizer,BertModel
 from util import set_seed,process_data,getnegfrombatch,select_similar_data_new
 import faiss
 
-from encode import bert_encoder
-
 def eval_model(config, basemodel, test_set, mem_relations):
     print("One eval")
     print("test data num is:",len(test_set))
