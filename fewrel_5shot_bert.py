@@ -9,7 +9,7 @@ import json
 import gc
 from tqdm import tqdm
 from sklearn.cluster import KMeans
-from encode import bert_encoder,BERTSentenceEncoder
+from encode import BERTSentenceEncoder
 from dataprocess import data_sampler_bert as data_sampler
 from model import proto_softmax_layer_bert as proto_softmax_layer
 from dataprocess import get_data_loader_bert as get_data_loader
@@ -162,15 +162,15 @@ def select_data(mem_set, proto_memory, config, model, divide_train_set, num_sel_
 tempthre = 0.2
 
 def train_model_with_hard_neg(config, model, mem_set, traindata, epochs, current_proto, ifnegtive=0):
-    print('train_data len:',len(traindata))
+    # print('train_data len:',len(traindata))
     #print(len(train_set))
     mem_data = []
     if len(mem_set) != 0:
         for key in mem_set.keys():
             mem_data.extend(mem_set[key]['0'])
-    print('memory_len:',len(mem_data))
+    # print('memory_len:',len(mem_data))
     train_set = traindata + mem_data
-    print('total_len:',len(train_set))
+    # print('total_len:',len(train_set))
     data_loader = get_data_loader(config, train_set, batch_size=config['batch_size_per_step'])
     model.train()
     criterion = nn.CrossEntropyLoss()
@@ -361,7 +361,7 @@ if __name__ == '__main__':
 
     select_thredsold_param = 0.65
     select_num = 1
-    f = open("config/config_fewrel_5and10.json", "r")
+    f = open("config/config_fewrel_5_bert.json", "r")
     config = json.loads(f.read())
     f.close()
     config['device'] = torch.device('cuda' if torch.cuda.is_available() and config['use_gpu'] else 'cpu')
@@ -415,7 +415,7 @@ if __name__ == '__main__':
         # encoderforbase=bert_encoder(config)
         encoderforbase=BERTSentenceEncoder(config)
         sampler = data_sampler(config, encoderforbase.tokenizer)
-        modelforbase = proto_softmax_layer(encoderforbase, num_class=len(sampler.id2rel), id2rel=sampler.id2rel, drop=0, config=config)
+        modelforbase = proto_softmax_layer(encoderforbase, num_class=len(sampler.id2rel), id2rel=sampler.id2rel, drop=0.1, config=config)
         modelforbase = modelforbase.to(config["device"])
         #
         # word2vec_back = word2vec.copy()
@@ -464,30 +464,30 @@ if __name__ == '__main__':
                     divide_train_set[data[0]].append(data)
                 print('divide_train_set:',len(divide_train_set))
 
-                ####select most similar sentence for new task, not for base task
+                ###select most similar sentence for new task, not for base task
 
-                ####step==0是base model
-                # if steps == 0:
-                #     ##train base model
-                #     print("train base model,not select most similar")
-                #
-                # else:
-                #     print("train new model,select most similar")
-                #     selectdata = select_similar_data_new_bert(training_data, tokenizer, entpair2scope, topk,
-                #                                             max_sen_length_for_select,list_data, config, SimModel,
-                #                                             select_thredsold,max_sen_lstm_tokenize,encoderforbase.tokenizer,index,ifnorm,select_num)
-                #     print('selected data length:',len(selectdata))
-                #     training_data.extend(selectdata)
-                #     print('expanded training_data length:',len(training_data))
+                ###step==0是base model
+                if steps == 0:
+                    ##train base model
+                    print("train base model,not select most similar")
+
+                else:
+                    print("train new model,select most similar")
+                    selectdata = select_similar_data_new_bert(training_data, tokenizer, entpair2scope, topk,
+                                                            max_sen_length_for_select,list_data, config, SimModel,
+                                                            select_thredsold,max_sen_lstm_tokenize,encoderforbase.tokenizer,index,ifnorm,select_num)
+                    print('selected data length:',len(selectdata))
+                    training_data.extend(selectdata)
+                    print('expanded training_data length:',len(training_data))
 
                 current_proto = get_memory(config, modelforbase, proto_memory)
                 modelforbase = train_simple_model(config, modelforbase, mem_set, training_data, 1, current_proto, False)
-                select_data(mem_set, proto_memory, config, modelforbase, divide_train_set,
-                            config['rel_memory_size'], current_relations, 0)  ##config['rel_memory_size'] == 1
+                mem_set = select_data(mem_set, proto_memory, config, modelforbase, divide_train_set,
+                            config['rel_memory_size'], current_relations, 1)  ##config['rel_memory_size'] == 1
 
                 #######select_data_whole(mem_set, proto_memory, config, modelforbase, divide_train_set,config['rel_memory_size'] * len(current_relations), current_relations)
 
-                for j in range(2):#  'The training of θ and updating of ri is done iteratively'
+                for j in tqdm(range(5)):#  'The training of θ and updating of ri is done iteratively'
                     current_proto = get_memory(config, modelforbase, proto_memory)
                     modelforbase = train_model_with_hard_neg(config, modelforbase, mem_set, training_data, 1,
                                                              current_proto, ifnegtive=0)
@@ -523,9 +523,9 @@ if __name__ == '__main__':
                 torch.cuda.empty_cache()
             # encoderforbase = bert_encoder(token2id=word2id, word2vec=word2vec_back.copy(), word_size=len(word2vec[0]),max_length=128, pos_size=None,
             #                               hidden_size=config['hidden_size'], dropout=0, bidirectional=True, num_layers=1, config=config)
-            encoderforbase = bert_encoder(config)
+            encoderforbase = BERTSentenceEncoder(config)
             modelforbase = proto_softmax_layer(encoderforbase, num_class=len(sampler.id2rel), id2rel=sampler.id2rel,
-                                               drop=0, config=config)
+                                               drop=0.1, config=config)
             modelforbase.to(config["device"])
             # output the final avg result
         print("Final result!")

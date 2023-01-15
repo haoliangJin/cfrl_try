@@ -4,6 +4,7 @@ import wordninja
 import random
 import re
 from torch.utils.data import Dataset, DataLoader
+import json
 
 class sequence_data_sampler(object):
 
@@ -159,7 +160,7 @@ class data_sampler(object):
         self.test_data = self._gen_data(config['test_file'])
 
         ##load relation
-        self.relation_names, self.id2rel = self._read_relations(config['relation_file'])
+        self.relation_names, self.id2rel = self._read_relations(config['relation_file'],config['relation_info_file'])
         self.id2rel_pattern = {}
         for i in self.id2rel:
             tokens, fakefirstent, fakefirstindex, fakesecondent, fakesecondindex, fakeheadid, faketailid, rawtext, length, fakelabel = self._transfrom_sentence(self.id2rel[i])
@@ -297,13 +298,25 @@ class data_sampler(object):
     def _remove_return_sym(self, str):
         return str.split('\n')[0]
 
-    def _read_relations(self, file):
+    def _read_relations(self, file,file2=None):
         relation_list = [self._split_relation_into_words(self._remove_return_sym('fill fill fill'))]
         id2rel = {0: 'fill fill fill'}
+        relation_info={}
+        if file2:
+            with open(file2,'r') as f:
+                relation_info_origin=json.load(f)
+            f.close()
+            for key,value in relation_info_origin.items():
+                rel,info=value
+                relation_info[rel]=info.split()
         with open(file) as file_in:
             for line in file_in:
-                relation_list.append(self._split_relation_into_words(self._remove_return_sym(line)))
-                id2rel[len(id2rel)] = self._remove_return_sym(line)
+                rel=self._split_relation_into_words(self._remove_return_sym(line))
+                rel_addinfo=rel.split()
+                if rel in relation_info:
+                    rel_addinfo+=relation_info[rel]
+                relation_list.append(rel)
+                id2rel[len(id2rel)] = ' '.join(rel_addinfo)
         return relation_list, id2rel
 
     def _split_relation_into_words(self, relation):

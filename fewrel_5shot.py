@@ -400,10 +400,9 @@ if __name__ == '__main__':
 
         encoderforbase = lstm_encoder(token2id=word2id, word2vec=word2vec, word_size=len(word2vec[0]), max_length=128, pos_size=None,
                                     hidden_size=config['hidden_size'], dropout=0, bidirectional=True, num_layers=1, config=config)
-        #
-        # # try bert encoder
-        # config['pretrained_model']="/home/sjhl/bert-base-uncased"
-        # encoderforbase=bert_encoder(config)
+
+        # add relation_info
+        config['relation_info_file']='./data/fewrel/fewrel_rel_info.json'
 
         sampler = data_sampler(config, encoderforbase.tokenizer)
         modelforbase = proto_softmax_layer(encoderforbase, num_class=len(sampler.id2rel), id2rel=sampler.id2rel, drop=0, config=config)
@@ -455,8 +454,8 @@ if __name__ == '__main__':
                     divide_train_set[data[0]].append(data)
                 print('divide_train_set:',len(divide_train_set))
 
-                # ####select most similar sentence for new task, not for base task
-                #
+                ####select most similar sentence for new task, not for base task
+
                 # ####step==0是base model
                 # if steps == 0:
                 #     ##train base model
@@ -526,6 +525,7 @@ if __name__ == '__main__':
             print('')
         avg_result_all_test = np.average(sequence_results, 0)
         for one in avg_result_all_test:
+            sys.stdout.write('final_avg_result!!!')
             sys.stdout.write('%.4f, ' % one)
         print('')
         print("Finish training............................")
