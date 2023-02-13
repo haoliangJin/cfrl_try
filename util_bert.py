@@ -24,7 +24,7 @@ def getnegfrombatch_bert(oneindex,firstent,firstentindex,secondent,secondentinde
     headend = thisfirstentindex[-1]
     posheadlength = len(thisfirstentindex)
 
-    thisheadid=headid[oneindex]
+    thisheadid = headid[oneindex]
 
     thissecondent = secondent[oneindex]
     thissecondentindex = secondentindex[oneindex].numpy().tolist()
@@ -32,7 +32,7 @@ def getnegfrombatch_bert(oneindex,firstent,firstentindex,secondent,secondentinde
     tailend = thissecondentindex[-1]
     postaillength = len(thissecondentindex)
 
-    thistailid=tailid[oneindex]
+    thistailid = tailid[oneindex]
 
     negres = []
     maskres = []
@@ -81,20 +81,34 @@ def getnegfrombatch_bert(oneindex,firstent,firstentindex,secondent,secondentinde
 
         negres.append(negsamplechangehead)
         maskres.append(mask1)
-        headidres.append(thisheadid)
-        tailidres.append(min(thistailid- posheadlength + negheadlength, config["max_length"]))
+        # headidres.append(thisheadid)
+        # tailidres.append(min(thistailid- posheadlength + negheadlength, config["max_length"]))
+
+        # tailid might be smaller than headid
+        if thisheadid < thistailid:
+            headidres.append(thisheadid)
+            tailidres.append(min(thistailid - posheadlength + negheadlength, config["max_length"]))
+        else:
+            headidres.append(thisheadid)
+            tailidres.append(thistailid)
 
         negres.append(negsamplechangetail)
         maskres.append(mask2)
-        headidres.append(thisheadid)
-        tailidres.append(thistailid)
+        # headidres.append(thisheadid)
+        # tailidres.append(thistailid)
+        if thisheadid < thistailid:
+            headidres.append(thisheadid)
+            tailidres.append(thistailid)
+        else:
+            tailidres.append(thistailid)
+            headidres.append(min(thisheadid - postaillength + negtaillength, config["max_length"]))
 
 
 
     return np.asarray(negres),np.asarray(maskres),np.asarray(headidres),np.asarray(tailidres)
 
 
-def generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,secondentindex,headid,tailid,sentences,lengths,neg_num,allnum,labels,neg_labels,config,seed):
+def generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,secondentindex,headid,tailid,sentences,lengths,neg_num,allnum,labels,neg_labels,config, epoch_i, head_flag_list_all, touseindex_list_all):
     # random.seed(seed)
     thissentence = sentences[oneindex].cpu().numpy().tolist()
     thislength = lengths[oneindex]
@@ -116,15 +130,29 @@ def generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,seconden
 
     negres = []
     maskres = []
-    headidres=[]
-    tailidres=[]
+    headidres = []
+    tailidres = []
+
+    if epoch_i == 0:
+        head_flag_list = []
+        touseindex_list = []
+    else:
+        head_flag_list = head_flag_list_all[oneindex]
+        touseindex_list = touseindex_list_all[oneindex]
 
     for j in range(neg_num):
-        change_head_flag = random.randint(0, 1)
-        while True:
-            touseindex = random.randint(0, allnum-1)
-            if touseindex != oneindex:
-                break
+        if epoch_i == 0:
+            change_head_flag = random.randint(0, 1)
+            head_flag_list.append(change_head_flag)
+            while True:
+                touseindex = random.randint(0, allnum-1)
+                if touseindex != oneindex:
+                    break
+            touseindex_list.append(touseindex)
+        else:
+            change_head_flag = head_flag_list[j]
+            touseindex = touseindex_list[j]
+
         if change_head_flag:
             negusehead = firstent[touseindex].numpy().tolist()
             negheadlength = len(negusehead)
@@ -175,7 +203,7 @@ def generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,seconden
             else:
                 tailidres.append(thistailid)
                 headidres.append(min(thisheadid - postaillength + negtaillength, config["max_length"]))
-    return np.asarray(negres),np.asarray(maskres),np.asarray(headidres),np.asarray(tailidres)
+    return np.asarray(negres), np.asarray(maskres), np.asarray(headidres), np.asarray(tailidres), head_flag_list, touseindex_list
 
 
 def normalize(*xs):
@@ -186,17 +214,24 @@ def transpose(x):
     return x.transpose(-2, -1)
 
 
-def infonce_loss(query, pos_emb, neg_emb, temp=0.1, reduction='mean'):
+def infonce_loss(query, pos_emb, neg_emb, temp=0.1, reduction='mean', type='mem', threshold=0.5):
     query, pos_emb, neg_emb = normalize(query, pos_emb, neg_emb)
     positive_logit = torch.sum(query * pos_emb, dim=1, keepdim=True)
-
     query = query.unsqueeze(1)
     negative_logits = query @ transpose(neg_emb)
     negative_logits = negative_logits.squeeze(1)
-    # First index in last dimension are the positive samples
-    logits = torch.cat([positive_logit, negative_logits], dim=1)
-    labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
-    return F.cross_entropy(logits / temp, labels, reduction=reduction)
+    if type == 'mem':
+        # First index in last dimension are the positive samples
+        logits = torch.cat([positive_logit, negative_logits], dim=1)
+        labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
+        return F.cross_entropy(logits / temp, labels, reduction=reduction)
+    else:
+        negative_logits[abs(negative_logits) < threshold] = -1e9
+        logits = torch.cat([positive_logit, negative_logits], dim=1)
+        labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
+        return F.cross_entropy(logits / temp, labels, reduction=reduction)
+
+
 
 
 def handletoken(raw_text,h_pos_li,t_pos_li,tokenizer):

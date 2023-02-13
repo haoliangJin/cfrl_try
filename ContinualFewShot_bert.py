@@ -76,7 +76,7 @@ def get_memory(config, model, proto_set):
     protos = []
     for i in range(len(proto_set)):
         # protos.append(torch.tensor(features[rangeset[i]:rangeset[i+1],:].mean(0, keepdims = True)))
-        if rangeset[i]==rangeset[i + 1]-1:
+        if rangeset[i] == rangeset[i + 1]-1:
             protos.append(torch.tensor(features[rangeset[i]:rangeset[i + 1], :].mean(0, keepdims=True)))
         else:
             protos.append(torch.tensor(features[rangeset[i]+1:rangeset[i + 1], :].mean(0, keepdims=True)) + torch.tensor(features[rangeset[i],:]))
@@ -154,17 +154,21 @@ def select_data(mem_set, proto_memory, config, model, divide_train_set, num_sel_
 tempthre = 0.2
 
 
-def train_contrastive_model(config, model, mem_set, traindata, epochs, current_proto, seen_relations, seed, neg_num = 5, self_neg_lambda = 0.05, use_projector = False):
+def train_contrastive_model(config, model, mem_set, traindata, epochs, current_proto, seen_relations, batch_size = 8, use_sample_self_contrastive = False, use_mem_self_contrastive = False, use_projector = False):
     mem_data=[]
     if len(mem_set) != 0:
         for key in mem_set.keys():
             mem_data.extend(mem_set[key]['0'])
     # print(len(mem_data))
     train_set = traindata
-    data_loader = get_data_loader_bert(config, train_set, batch_size=config['batch_size_per_step'])
+    # data_loader = get_data_loader_bert(config, train_set, batch_size=config['batch_size_per_step'])
+    data_loader = get_data_loader_bert(config, train_set, batch_size = batch_size)
     # mem_data_loader = get_data_loader_bert(config, mem_data, batch_size = config['batch_size_per_step'], shuffle=False)
+    # optimizer = AdamW(model.parameters(), lr = 2e-5, correct_bias=False)
     optimizer = AdamW(model.parameters(), lr = 2e-5)
-    batch_cum_loss = 0.
+
+    head_flag_list_all = []
+    touseindex_list_all = []
     for epoch_i in range(epochs):
         batch_loss = []
         model.set_memorized_prototypes(current_proto)
@@ -190,24 +194,61 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
             model.zero_grad()
             optimizer.zero_grad()
             allnum=len(labels)
-            self_neg = []
-            self_mask = []
-            self_headid = []
-            self_tailid = []
-            for oneindex in range(allnum):
-                negres, maskres, headres, tailres = generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,secondentindex,headid,tailid,sentences,lengths,neg_num,allnum,labels,neg_labels,config,seed)
-                for aa in negres:
-                    self_neg.append(torch.tensor(aa))
-                for aa in maskres:
-                    self_mask.append(torch.tensor(aa))
-                for aa in headres:
-                    self_headid.append(torch.tensor(aa))
-                for aa in tailres:
-                    self_tailid.append(torch.tensor(aa))
-            self_negtensor = torch.stack(self_neg, 0)
-            self_masktensor = torch.stack(self_mask, 0)
-            self_headtensor = torch.stack(self_headid, 0)
-            self_tailtensor = torch.stack(self_tailid, 0)
+
+            # sample self contrastive
+            if use_sample_self_contrastive:
+                neg_num = 2
+                self_neg = []
+                self_mask = []
+                self_headid = []
+                self_tailid = []
+                for oneindex in range(allnum):
+                    negres, maskres, headres, tailres, head_flag_list, touseindex_list = generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,
+                                                                                  secondentindex,headid,tailid,sentences,lengths,neg_num,
+                                                                                  allnum,labels,neg_labels,config,epoch_i, head_flag_list_all, touseindex_list_all)
+                    if epoch_i == 0:
+                        head_flag_list_all.append(head_flag_list)
+                        touseindex_list_all.append(touseindex_list)
+                    for aa in negres:
+                        self_neg.append(torch.tensor(aa))
+                    for aa in maskres:
+                        self_mask.append(torch.tensor(aa))
+                    for aa in headres:
+                        self_headid.append(torch.tensor(aa))
+                    for aa in tailres:
+                        self_tailid.append(torch.tensor(aa))
+                self_negtensor = torch.stack(self_neg, 0)
+                self_masktensor = torch.stack(self_mask, 0)
+                self_headtensor = torch.stack(self_headid, 0)
+                self_tailtensor = torch.stack(self_tailid, 0)
+
+            # mem self contrastive
+            if use_mem_self_contrastive:
+                memindex = []
+                numofmem = 0
+                for index, onetype in enumerate(typelabels):
+                    if onetype == 3:
+                        numofmem += 1
+                        memindex.append(index)
+                getnegfromnum = 1
+                allneg = []
+                allmask = []
+                allheadid = []
+                alltailid = []
+                if numofmem > 0:
+                    for oneindex in memindex:
+                        negres, maskres, headres, tailres = getnegfrombatch_bert(oneindex, firstent, firstentindex,
+                                                                                 secondent, secondentindex, headid, tailid,
+                                                                                 sentences, lengths, getnegfromnum, allnum,
+                                                                                 labels, neg_labels, config)
+                        for aa in negres:
+                            allneg.append(torch.tensor(aa))
+                        for aa in maskres:
+                            allmask.append(torch.tensor(aa))
+                        for aa in headres:
+                            allheadid.append(torch.tensor(aa))
+                        for aa in tailres:
+                            alltailid.append(torch.tensor(aa))
 
             pos_mem_sent_emb, neg_mem_sent_emb = [], []
             pos_mem_mask, neg_mem_mask = [], []
@@ -258,31 +299,82 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
             # headid = headid.to(config['device'])
             # tailid = tailid.to(config['device'])
 
-            #cat self_neg
-            sentences = torch.cat((sentences, self_negtensor), 0)
-            mask = torch.cat((mask, self_masktensor), 0)
-            headid = torch.cat((headid, self_headtensor), 0)
-            tailid = torch.cat((tailid, self_tailtensor), 0)
+            # cat self_neg
+            if use_sample_self_contrastive:
+                sentences = torch.cat((sentences, self_negtensor), 0)
+                mask = torch.cat((mask, self_masktensor), 0)
+                headid = torch.cat((headid, self_headtensor), 0)
+                tailid = torch.cat((tailid, self_tailtensor), 0)
+
+            if use_mem_self_contrastive:
+                if numofmem > 0:
+                    negtensor = torch.stack(allneg, 0)
+                    masktensor = torch.stack(allmask, 0)
+                    headtensor = torch.stack(allheadid, 0)
+                    tailtensor = torch.stack(alltailid, 0)
+
+                    sentences = torch.cat((sentences, negtensor), 0)
+                    mask = torch.cat((mask, masktensor), 0)
+                    headid = torch.cat((headid, headtensor), 0)
+                    tailid = torch.cat((tailid, tailtensor), 0)
+
 
             sentences = sentences.to(config['device'])
             mask = mask.to(config['device'])
             # labels = labels.to(config['device'])
             logits, rep = model(sentences, mask, headid, tailid)
+            logits_drop, rep_drop = model(sentences, mask, headid, tailid)
 
             if use_projector:
                 rep = model.contrastive_forward(rep)
 
+            # mem_label_contrastive
             query = rep[ : allnum]
-
             mem_neg_emb = neg_mem_sent_emb.view(allnum, len(seen_relations)-1, -1)
+            loss1 = infonce_loss(query, pos_mem_sent_emb, mem_neg_emb, temp = 0.12)
+            loss = loss1
 
-            #self_neg
-            # self_neg_lambda = 0.1
-            self_neg_emb = rep[allnum : ]
-            self_neg_emb = self_neg_emb.view(allnum, neg_num, -1)
-            loss1 = infonce_loss(query, pos_mem_sent_emb, mem_neg_emb, temp=0.12)
-            loss2 = infonce_loss(query, pos_mem_sent_emb, self_neg_emb, temp=0.12)
-            loss = loss1 + self_neg_lambda * loss2
+            if use_sample_self_contrastive:
+                self_neg_lambda = 1
+                self_threshold = 0.9
+                self_neg_emb = rep[allnum : allnum * (neg_num + 1)]
+                self_neg_emb = self_neg_emb.view(allnum, neg_num, -1)
+                loss2 = infonce_loss(query, pos_mem_sent_emb, self_neg_emb, temp=0.12, type='self', threshold = self_threshold)
+                loss = loss1 + self_neg_lambda * loss2
+
+            # mem_neg
+            if use_mem_self_contrastive:
+                if numofmem > 0:
+                    self_mem_neg_lambda = 1
+                    self_mem_neg_emb = rep[allnum * (neg_num+  1) :]
+                    self_mem_neg_emb = self_mem_neg_emb.view(numofmem, 2 * getnegfromnum, -1)
+                    loss3 = infonce_loss(query[memindex], pos_mem_sent_emb[memindex], self_mem_neg_emb, temp=0.12)
+                    loss += self_mem_neg_lambda * loss3
+
+            # drop_neg_contrastive
+            label_set = set()
+            true_drop_index = []
+            for j, label in enumerate(labels):
+                if label not in label_set:
+                    label_set.add(label)
+                    true_drop_index.append(j)
+            query_drop = rep_drop[true_drop_index]
+            truenum = len(true_drop_index)
+            drop_neg_emb = []
+            for j in range(truenum):
+                temp = []
+                for k in range(truenum):
+                    if k != j:
+                        temp.append(query_drop[k])
+                temp = torch.stack(temp, 0)
+                drop_neg_emb.append(temp)
+            drop_neg_emb = torch.stack(drop_neg_emb, 0)
+            loss4 = infonce_loss(query[true_drop_index], query_drop, drop_neg_emb, temp = 0.04)
+            loss += 2 * loss4
+
+            # all_query_drop = rep_drop[ : allnum]
+            # loss5 = infonce_loss(query, all_query_drop, mem_neg_emb, temp = 0.08)
+            # loss += loss5
             loss.backward()
             # torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
             optimizer.step()
@@ -766,9 +858,7 @@ if __name__ == '__main__':
                         current_proto = get_memory(config, modelforbase, proto_memory)
                         modelforbase = train_contrastive_model(config, modelforbase, mem_set,
                                                                training_data, 1, current_proto, seen_relations,
-                                                               seed = config['random_seed'] + 10 * i ,
-                                                               neg_num = 2, self_neg_lambda = 0, use_projector = False)
-
+                                                               batch_size = 8)
                 current_proto = get_memory(config, modelforbase, proto_memory)
                 modelforbase.set_memorized_prototypes(current_proto)
                 mem_relations.extend(current_relations)
