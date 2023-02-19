@@ -13,12 +13,11 @@ from dataprocess_bert import data_sampler_bert
 from model_bert import proto_softmax_layer_bert
 from dataprocess_bert import get_data_loader_bert
 from transformers import BertTokenizer,BertModel,get_linear_schedule_with_warmup
-from util_bert import set_seed,process_data,select_similar_data_new_bert,getnegfrombatch_bert,generate_neg_samples_bert,infonce_loss
-import faiss
+from util_bert import set_seed,process_data,select_similar_data_new_bert,getnegfrombatch_bert,getnegfrombatch_bert_new,generate_neg_samples_bert,infonce_loss
 from transformers import AdamW
 import random
 from torch.optim import Adam
-
+import faiss
 
 def eval_model(config, basemodel, test_set, mem_relations, use_projector = False):
     print("One eval")
@@ -54,23 +53,63 @@ def eval_model(config, basemodel, test_set, mem_relations, use_projector = False
     basemodel.train()
     return acc
 
-def get_memory(config, model, proto_set):
+def get_memory(config, model, proto_set, sp_token = 0, get_neg = False):
     memset = []
     resset = []
-    rangeset= [0]
+    rangeset = [0]
     for i in proto_set:
         memset += i
         rangeset.append(rangeset[-1] + len(i))
-    data_loader = get_data_loader_bert(config, memset, False, False)
+    data_loader = get_data_loader_bert(config, memset, False, False, 1)
     features = []
+    all_neg_features = []
     for step, (labels, neg_labels, sentences, firstent, firstentindex, secondent, secondentindex, headid, tailid, rawtext, lengths,
                typelabels,mask) in enumerate(data_loader):
-        sentences = sentences.to(config['device'])
-        mask = mask.to(config['device'])
+
         if headid[0]!=-1:
-            feature = model.get_feature(sentences, mask, headid, tailid)
+            if get_neg:
+                # generate neg sample
+                allnum = len(labels)
+                negnum = 1
+                allneg, allmask, allheadid, alltailid = [], [], [], []
+                for oneindex in range(allnum):
+                    negres, maskres, headres, tailres = getnegfrombatch_bert_new(oneindex, firstent, firstentindex,
+                                                                             secondent, secondentindex, headid, tailid,
+                                                                             sentences, lengths, negnum, allnum,
+                                                                             labels, neg_labels, config, sp_token)
+                    for aa in negres:
+                        allneg.append(torch.tensor(aa))
+                    for aa in maskres:
+                        allmask.append(torch.tensor(aa))
+                    for aa in headres:
+                        allheadid.append(torch.tensor(aa))
+                    for aa in tailres:
+                        alltailid.append(torch.tensor(aa))
+                negtensor = torch.stack(allneg, 0)
+                masktensor = torch.stack(allmask, 0)
+                headtensor = torch.stack(allheadid, 0)
+                tailtensor = torch.stack(alltailid, 0)
+
+                sentences = torch.cat((sentences, negtensor), 0)
+                mask = torch.cat((mask, masktensor), 0)
+                headid = torch.cat((headid, headtensor), 0)
+                tailid = torch.cat((tailid, tailtensor), 0)
+
+                sentences = sentences.to(config['device'])
+                mask = mask.to(config['device'])
+                # feature = model.get_feature(sentences, mask, headid, tailid)
+                all_feature = model.get_feature(sentences, mask, headid, tailid)
+                feature = all_feature[ : allnum]
+                neg_feature = torch.from_numpy(all_feature[allnum:])
+                all_neg_features.append(neg_feature)
+            else:
+                sentences = sentences.to(config['device'])
+                mask = mask.to(config['device'])
+                feature = model.get_feature(sentences, mask, headid, tailid)
         else:
-            feature = model.get_feature(sentences, mask, headid, tailid,is_rel=True)
+            sentences = sentences.to(config['device'])
+            mask = mask.to(config['device'])
+            feature = model.get_feature(sentences, mask, headid, tailid, is_rel=True)
         features.append(feature)
     features = np.concatenate(features)
     protos = []
@@ -81,7 +120,9 @@ def get_memory(config, model, proto_set):
         else:
             protos.append(torch.tensor(features[rangeset[i]+1:rangeset[i + 1], :].mean(0, keepdims=True)) + torch.tensor(features[rangeset[i],:]))
     protos = torch.cat(protos, 0)
-    return protos
+    if get_neg:
+        all_neg_features = torch.stack(all_neg_features, 0)
+    return protos, all_neg_features
 
 def select_data(mem_set, proto_memory, config, model, divide_train_set, num_sel_data, current_relations, selecttype):
     rela_num = len(current_relations)
@@ -154,7 +195,7 @@ def select_data(mem_set, proto_memory, config, model, divide_train_set, num_sel_
 tempthre = 0.2
 
 
-def train_contrastive_model(config, model, mem_set, traindata, epochs, current_proto, seen_relations, batch_size = 8, use_sample_self_contrastive = False, use_mem_self_contrastive = False, use_projector = False):
+def train_contrastive_model(config, model, mem_set, traindata, epochs, current_proto, seen_relations, mem_neg_features, batch_size = 8, use_sample_self_contrastive = False, use_mem_self_contrastive = False, use_projector = False):
     mem_data=[]
     if len(mem_set) != 0:
         for key in mem_set.keys():
@@ -169,6 +210,7 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
 
     head_flag_list_all = []
     touseindex_list_all = []
+    seen_relations_sorted = sorted(seen_relations)
     for epoch_i in range(epochs):
         batch_loss = []
         model.set_memorized_prototypes(current_proto)
@@ -196,31 +238,55 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
             allnum=len(labels)
 
             # sample self contrastive
-            if use_sample_self_contrastive:
-                neg_num = 2
-                self_neg = []
-                self_mask = []
-                self_headid = []
-                self_tailid = []
-                for oneindex in range(allnum):
-                    negres, maskres, headres, tailres, head_flag_list, touseindex_list = generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,
-                                                                                  secondentindex,headid,tailid,sentences,lengths,neg_num,
-                                                                                  allnum,labels,neg_labels,config,epoch_i, head_flag_list_all, touseindex_list_all)
-                    if epoch_i == 0:
-                        head_flag_list_all.append(head_flag_list)
-                        touseindex_list_all.append(touseindex_list)
-                    for aa in negres:
-                        self_neg.append(torch.tensor(aa))
-                    for aa in maskres:
-                        self_mask.append(torch.tensor(aa))
-                    for aa in headres:
-                        self_headid.append(torch.tensor(aa))
-                    for aa in tailres:
-                        self_tailid.append(torch.tensor(aa))
-                self_negtensor = torch.stack(self_neg, 0)
-                self_masktensor = torch.stack(self_mask, 0)
-                self_headtensor = torch.stack(self_headid, 0)
-                self_tailtensor = torch.stack(self_tailid, 0)
+            # if use_sample_self_contrastive:
+            #     neg_num = 2
+            #     self_neg = []
+            #     self_mask = []
+            #     self_headid = []
+            #     self_tailid = []
+            #     for oneindex in range(allnum):
+            #         negres, maskres, headres, tailres, head_flag_list, touseindex_list = generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,
+            #                                                                       secondentindex,headid,tailid,sentences,lengths,neg_num,
+            #                                                                       allnum,labels,neg_labels,config,epoch_i, head_flag_list_all, touseindex_list_all)
+            #         if epoch_i == 0:
+            #             head_flag_list_all.append(head_flag_list)
+            #             touseindex_list_all.append(touseindex_list)
+            #         for aa in negres:
+            #             self_neg.append(torch.tensor(aa))
+            #         for aa in maskres:
+            #             self_mask.append(torch.tensor(aa))
+            #         for aa in headres:
+            #             self_headid.append(torch.tensor(aa))
+            #         for aa in tailres:
+            #             self_tailid.append(torch.tensor(aa))
+            #     self_negtensor = torch.stack(self_neg, 0)
+            #     self_masktensor = torch.stack(self_mask, 0)
+            #     self_headtensor = torch.stack(self_headid, 0)
+            #     self_tailtensor = torch.stack(self_tailid, 0)
+
+            # if use_sample_self_contrastive:
+            #     neg_num = 1
+            #     true_neg_num = 2 * neg_num
+            #     self_neg = []
+            #     self_mask = []
+            #     self_headid = []
+            #     self_tailid = []
+            #     for oneindex in range(allnum):
+            #         negres, maskres, headres, tailres= getnegfrombatch_bert_new(oneindex,firstent,firstentindex,secondent,
+            #                                                                       secondentindex,headid,tailid,sentences,lengths,neg_num,
+            #                                                                       allnum,labels,neg_labels,config,sp_token)
+            #         for aa in negres:
+            #             self_neg.append(torch.tensor(aa))
+            #         for aa in maskres:
+            #             self_mask.append(torch.tensor(aa))
+            #         for aa in headres:
+            #             self_headid.append(torch.tensor(aa))
+            #         for aa in tailres:
+            #             self_tailid.append(torch.tensor(aa))
+            #     self_negtensor = torch.stack(self_neg, 0)
+            #     self_masktensor = torch.stack(self_mask, 0)
+            #     self_headtensor = torch.stack(self_headid, 0)
+            #     self_tailtensor = torch.stack(self_tailid, 0)
 
             # mem self contrastive
             if use_mem_self_contrastive:
@@ -237,10 +303,10 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
                 alltailid = []
                 if numofmem > 0:
                     for oneindex in memindex:
-                        negres, maskres, headres, tailres = getnegfrombatch_bert(oneindex, firstent, firstentindex,
+                        negres, maskres, headres, tailres = getnegfrombatch_bert_new(oneindex, firstent, firstentindex,
                                                                                  secondent, secondentindex, headid, tailid,
                                                                                  sentences, lengths, getnegfromnum, allnum,
-                                                                                 labels, neg_labels, config)
+                                                                                 labels, neg_labels, config,sp_token)
                         for aa in negres:
                             allneg.append(torch.tensor(aa))
                         for aa in maskres:
@@ -300,11 +366,11 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
             # tailid = tailid.to(config['device'])
 
             # cat self_neg
-            if use_sample_self_contrastive:
-                sentences = torch.cat((sentences, self_negtensor), 0)
-                mask = torch.cat((mask, self_masktensor), 0)
-                headid = torch.cat((headid, self_headtensor), 0)
-                tailid = torch.cat((tailid, self_tailtensor), 0)
+            # if use_sample_self_contrastive:
+            #     sentences = torch.cat((sentences, self_negtensor), 0)
+            #     mask = torch.cat((mask, self_masktensor), 0)
+            #     headid = torch.cat((headid, self_headtensor), 0)
+            #     tailid = torch.cat((tailid, self_tailtensor), 0)
 
             if use_mem_self_contrastive:
                 if numofmem > 0:
@@ -333,20 +399,22 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
             mem_neg_emb = neg_mem_sent_emb.view(allnum, len(seen_relations)-1, -1)
             loss1 = infonce_loss(query, pos_mem_sent_emb, mem_neg_emb, temp = 0.12)
             loss = loss1
-
-            if use_sample_self_contrastive:
-                self_neg_lambda = 1
-                self_threshold = 0.9
-                self_neg_emb = rep[allnum : allnum * (neg_num + 1)]
-                self_neg_emb = self_neg_emb.view(allnum, neg_num, -1)
-                loss2 = infonce_loss(query, pos_mem_sent_emb, self_neg_emb, temp=0.12, type='self', threshold = self_threshold)
-                loss = loss1 + self_neg_lambda * loss2
+            # loss = 0.0
+            # if use_sample_self_contrastive:
+            #     self_neg_lambda = 0.0
+            #     self_threshold = 0.9
+            #     self_neg_emb = rep[allnum : allnum * (true_neg_num + 1)]
+            #     self_neg_emb = self_neg_emb.view(allnum, true_neg_num, -1)
+            #     # loss2 = infonce_loss(query, pos_mem_sent_emb, self_neg_emb, temp=0.12, type='self', threshold = self_threshold)
+            #     loss2 = infonce_loss(query, rep_drop[ : allnum], self_neg_emb, temp=0.2)
+            #     loss += self_neg_lambda * loss2
 
             # mem_neg
             if use_mem_self_contrastive:
                 if numofmem > 0:
                     self_mem_neg_lambda = 1
-                    self_mem_neg_emb = rep[allnum * (neg_num+  1) :]
+                    # self_mem_neg_emb = rep[allnum * (neg_num+  1) :]
+                    self_mem_neg_emb = rep[allnum :]
                     self_mem_neg_emb = self_mem_neg_emb.view(numofmem, 2 * getnegfromnum, -1)
                     loss3 = infonce_loss(query[memindex], pos_mem_sent_emb[memindex], self_mem_neg_emb, temp=0.12)
                     loss += self_mem_neg_lambda * loss3
@@ -371,6 +439,17 @@ def train_contrastive_model(config, model, mem_set, traindata, epochs, current_p
             drop_neg_emb = torch.stack(drop_neg_emb, 0)
             loss4 = infonce_loss(query[true_drop_index], query_drop, drop_neg_emb, temp = 0.04)
             loss += 2 * loss4
+
+            # mem_proto_neg
+
+            # mem_proto_neg = []
+            # for label in labels:
+            #     index = seen_relations_sorted.index(label)
+            #     mem_proto_neg.append(mem_neg_features[index].cuda())
+            # mem_proto_neg = torch.stack(mem_proto_neg, 0)
+            # loss5 = infonce_loss(query, pos_mem_sent_emb, mem_proto_neg, temp = 0.2, type = 'self', threshold = 0.9)
+            # loss += loss5
+
 
             # all_query_drop = rep_drop[ : allnum]
             # loss5 = infonce_loss(query, all_query_drop, mem_neg_emb, temp = 0.08)
@@ -536,7 +615,7 @@ def train_model_with_hard_neg(config, model, mem_set, traindata, epochs, current
         print('hard loss!:%.4f'%(loss.mean()))
     return model
 
-def train_simple_model(config, model, mem_set, traindata, epochs, current_proto, ifusemem=False):
+def train_simple_model(config, model, mem_set, traindata, epochs, current_proto, ifusemem=False, batch_size = 5, steps = 0, use_self_neg_contrastive = False):
     train_set = traindata
     if ifusemem:
         mem_data = []
@@ -553,7 +632,7 @@ def train_simple_model(config, model, mem_set, traindata, epochs, current_proto,
     #     # print(len(mem_data))
     #     train_set = train_set + mem_data
 
-    data_loader = get_data_loader_bert(config, train_set, batch_size = config['batch_size_per_step'])
+    data_loader = get_data_loader_bert(config, train_set, batch_size = batch_size)
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -581,43 +660,124 @@ def train_simple_model(config, model, mem_set, traindata, epochs, current_proto,
 
         for step, (labels, neg_labels, sentences, firstent, firstentindex, secondent, secondentindex, headid, tailid, rawtext,
                    lengths, typelabels, mask) in enumerate(data_loader):
-            model.zero_grad()
-            sentences = sentences.to(config['device'])
-            mask = mask.to(config['device'])
-            logits, rep = model(sentences, mask,headid,tailid)
-            logits_proto = model.mem_forward(rep)
+            if not steps:
+                model.zero_grad()
+                sentences = sentences.to(config['device'])
+                mask = mask.to(config['device'])
+                logits, rep = model(sentences, mask,headid,tailid)
+                logits_proto = model.mem_forward(rep)
 
-            labels = labels.to(config['device'])
-            loss1 = criterion(logits, labels)
-            loss2 = criterion(logits_proto, labels)
-            loss4 = lossfn(logits_proto, labels)
-            loss3 = torch.tensor(0.0).to(config['device'])
-            for index, logit in enumerate(logits):
-                score = logits_proto[index]
-                preindex = labels[index]
-                maxscore = score[preindex]
-                size = score.shape[0]
-                secondmax = -100000
-                for j in range(size):
-                    if j != preindex and score[j] > secondmax:
-                        secondmax = score[j]
-                if secondmax - maxscore + tempthre > 0.0:
-                    loss3 += (secondmax - maxscore + tempthre).to(config['device'])
+                labels = labels.to(config['device'])
+                loss1 = criterion(logits, labels)
+                loss2 = criterion(logits_proto, labels)
+                loss4 = lossfn(logits_proto, labels)
+                loss3 = torch.tensor(0.0).to(config['device'])
+                for index, logit in enumerate(logits):
+                    score = logits_proto[index]
+                    preindex = labels[index]
+                    maxscore = score[preindex]
+                    size = score.shape[0]
+                    secondmax = -100000
+                    for j in range(size):
+                        if j != preindex and score[j] > secondmax:
+                            secondmax = score[j]
+                    if secondmax - maxscore + tempthre > 0.0:
+                        loss3 += (secondmax - maxscore + tempthre).to(config['device'])
 
-            loss3 /= logits.shape[0]
-            loss = loss1 * lossesfactor1 + loss2 * lossesfactor2 + loss3 * lossesfactor3 + loss4 * lossesfactor4
-            loss.backward()
+                loss3 /= logits.shape[0]
+                loss = loss1 * lossesfactor1 + loss2 * lossesfactor2 + loss3 * lossesfactor3 + loss4 * lossesfactor4
+                loss.backward()
 
-            #for n, p in model.named_parameters():
-            #    if p.requires_grad:
-            #        print(n, p.grad.shape)
-            losses1.append(loss1.item())
-            losses2.append(loss2.item())
-            losses3.append(loss3.item())
-            losses4.append(loss4.item())
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
-            optimizer.step()
-            # scheduler.step()
+                #for n, p in model.named_parameters():
+                #    if p.requires_grad:
+                #        print(n, p.grad.shape)
+                losses1.append(loss1.item())
+                losses2.append(loss2.item())
+                losses3.append(loss3.item())
+                losses4.append(loss4.item())
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
+                optimizer.step()
+                # scheduler.step()
+            else:
+                model.zero_grad()
+                neg_num = 1
+                true_neg_num = 2 * neg_num
+                self_neg = []
+                self_mask = []
+                self_headid = []
+                self_tailid = []
+                allnum = len(labels)
+                for oneindex in range(allnum):
+                    negres, maskres, headres, tailres = getnegfrombatch_bert_new(oneindex, firstent, firstentindex,
+                                                                                 secondent,
+                                                                                 secondentindex, headid, tailid,
+                                                                                 sentences, lengths, neg_num,
+                                                                                 allnum, labels, neg_labels, config,
+                                                                                 sp_token)
+                    for aa in negres:
+                        self_neg.append(torch.tensor(aa))
+                    for aa in maskres:
+                        self_mask.append(torch.tensor(aa))
+                    for aa in headres:
+                        self_headid.append(torch.tensor(aa))
+                    for aa in tailres:
+                        self_tailid.append(torch.tensor(aa))
+                self_negtensor = torch.stack(self_neg, 0)
+                self_masktensor = torch.stack(self_mask, 0)
+                self_headtensor = torch.stack(self_headid, 0)
+                self_tailtensor = torch.stack(self_tailid, 0)
+                sentences = torch.cat((sentences, self_negtensor), 0)
+                mask = torch.cat((mask, self_masktensor), 0)
+                headid = torch.cat((headid, self_headtensor), 0)
+                tailid = torch.cat((tailid, self_tailtensor), 0)
+
+                sentences = sentences.to(config['device'])
+                mask = mask.to(config['device'])
+                logits, rep = model(sentences, mask, headid, tailid)
+                logits_drop, rep_drop = model(sentences, mask, headid, tailid)
+                logits1, rep1 = logits[ : allnum], rep[ : allnum]
+                logits_proto = model.mem_forward(rep1)
+
+                labels = labels.to(config['device'])
+                loss1 = criterion(logits1, labels)
+                loss2 = criterion(logits_proto, labels)
+                loss4 = lossfn(logits_proto, labels)
+                loss3 = torch.tensor(0.0).to(config['device'])
+                for index, logit in enumerate(logits1):
+                    score = logits_proto[index]
+                    preindex = labels[index]
+                    maxscore = score[preindex]
+                    size = score.shape[0]
+                    secondmax = -100000
+                    for j in range(size):
+                        if j != preindex and score[j] > secondmax:
+                            secondmax = score[j]
+                    if secondmax - maxscore + tempthre > 0.0:
+                        loss3 += (secondmax - maxscore + tempthre).to(config['device'])
+
+                loss3 /= logits1.shape[0]
+                loss = loss1 * lossesfactor1 + loss2 * lossesfactor2 + loss3 * lossesfactor3 + loss4 * lossesfactor4
+
+                # self neg contrastive
+                if use_self_neg_contrastive:
+                    self_neg_lambda = 1
+                    self_neg_emb = rep[allnum: allnum * (true_neg_num + 1)]
+                    self_neg_emb = self_neg_emb.view(allnum, true_neg_num, -1)
+                    # loss2 = infonce_loss(query, pos_mem_sent_emb, self_neg_emb, temp=0.12, type='self', threshold = self_threshold)
+                    loss5 = infonce_loss(rep[ : allnum], rep_drop[: allnum], self_neg_emb, temp = 0.12, type= 'self', threshold = 0.9)
+                    loss += self_neg_lambda * loss5
+
+                loss.backward()
+
+                # for n, p in model.named_parameters():
+                #    if p.requires_grad:
+                #        print(n, p.grad.shape)
+                losses1.append(loss1.item())
+                losses2.append(loss2.item())
+                losses3.append(loss3.item())
+                losses4.append(loss4.item())
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
+                optimizer.step()
         print('simple loss!:%.4f' % (loss.mean()))
     return model
 
@@ -716,10 +876,11 @@ if __name__ == '__main__':
     # word2vec = np.load(os.path.join(root_path, 'glove/word2vec.npy'))
 
     tokenizer = BertTokenizer.from_pretrained(bert_file)
-    distantpath = "data/distantdata/"
-    file1 = distantpath + "distant.json"
-    file2 = distantpath + "exclude_fewrel_distant.json"
-    list_data,entpair2scope = process_data(file1,file2)
+    sp_token = tokenizer.convert_tokens_to_ids("[unused4]")
+    # distantpath = "data/distantdata/"
+    # file1 = distantpath + "distant.json"
+    # file2 = distantpath + "exclude_fewrel_distant.json"
+    # list_data,entpair2scope = process_data(file1,file2)
     donum = 1
     topk = 16
     max_sen_length_for_select = 64
@@ -757,6 +918,17 @@ if __name__ == '__main__':
         config['training_file'] = "data/fewrel/CFRLdata_10_100_10_5/train_" + str(m) + ".txt"
         config['valid_file'] = "data/fewrel/CFRLdata_10_100_10_5/valid_" + str(m) + ".txt"
         config['test_file'] = "data/fewrel/CFRLdata_10_100_10_5/test_" + str(m) + ".txt"
+        #
+        # config["rel_cluster_label"] = "data/fewrel/CFRLdata_10_100_10_10/rel_cluster_label_" + str(m) + ".npy"
+        # config['training_file'] = "data/fewrel/CFRLdata_10_100_10_10/train_" + str(m) + ".txt"
+        # config['valid_file'] = "data/fewrel/CFRLdata_10_100_10_10/valid_" + str(m) + ".txt"
+        # config['test_file'] = "data/fewrel/CFRLdata_10_100_10_10/test_" + str(m) + ".txt"
+
+        # config["rel_cluster_label"] = "data/fewrel/CFRLdata_10_100_10_2/rel_cluster_label_" + str(m) + ".npy"
+        # config['training_file'] = "data/fewrel/CFRLdata_10_100_10_2/train_" + str(m) + ".txt"
+        # config['valid_file'] = "data/fewrel/CFRLdata_10_100_10_2/valid_" + str(m) + ".txt"
+        # config['test_file'] = "data/fewrel/CFRLdata_10_100_10_2/test_" + str(m) + ".txt"
+
         if config['pretrain']:
             # if ifuseckpt:
             #     encoderforbase = BERTSentenceEncoder(config=config,ckptpath = ckptpath)
@@ -798,8 +970,8 @@ if __name__ == '__main__':
 
             mem_data = []
 
-            for i in range(len(sampler.id2rel)):
-                proto_memory.append([sampler.id2rel_pattern[i]])
+            for j in range(len(sampler.id2rel)):
+                proto_memory.append([sampler.id2rel_pattern[j]])
             oneseqres = []
             ifnorm = True
             for steps, (training_data, valid_data, test_data, test_all_data, seen_relations, current_relations) in enumerate(sampler):
@@ -842,24 +1014,26 @@ if __name__ == '__main__':
                 # modelforbase = train_classify_model(config, modelforbase, mem_set, training_data, 1,  False)
 
                 for j in range(1):
-                    current_proto = get_memory(config, modelforbase, proto_memory)
-                    modelforbase = train_simple_model(config, modelforbase, mem_set, training_data, 1, current_proto, False)
+                    current_proto, _ = get_memory(config, modelforbase, proto_memory)
+                    modelforbase = train_simple_model(config, modelforbase, mem_set, training_data, 1, current_proto, False, batch_size = 5)
                     # select_data(mem_set, proto_memory, config, modelforbase, divide_train_set,
                     #             config['rel_memory_size'], current_relations, 0)  ##config['rel_memory_size'] == 1
                 select_data(mem_set, proto_memory, config, modelforbase, divide_train_set,
                             1, current_relations, 0)
 
                 for j in range(epochnum):
-                    current_proto = get_memory(config, modelforbase, proto_memory)
+                    current_proto, _ = get_memory(config, modelforbase, proto_memory)
                     # modelforbase = train_model_with_hard_neg(config, modelforbase, mem_set, training_data, 1, current_proto, ifnegtive=0)
-                    modelforbase = train_simple_model(config, modelforbase, mem_set, training_data, 1, current_proto, True)
+                    modelforbase = train_simple_model(config, modelforbase, mem_set, training_data,
+                                                      1, current_proto, True, batch_size = 5, steps = steps, use_self_neg_contrastive = True)
                 if steps != 0:
                     for j in range(contrastive_epochs):
-                        current_proto = get_memory(config, modelforbase, proto_memory)
+                        current_proto, mem_neg_features = get_memory(config, modelforbase, proto_memory, sp_token = sp_token, get_neg = True)
                         modelforbase = train_contrastive_model(config, modelforbase, mem_set,
-                                                               training_data, 1, current_proto, seen_relations,
+                                                               training_data, 1, current_proto, seen_relations, mem_neg_features,
+                                                               use_mem_self_contrastive = False,
                                                                batch_size = 8)
-                current_proto = get_memory(config, modelforbase, proto_memory)
+                current_proto, _ = get_memory(config, modelforbase, proto_memory)
                 modelforbase.set_memorized_prototypes(current_proto)
                 mem_relations.extend(current_relations)
 

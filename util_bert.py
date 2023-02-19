@@ -107,7 +107,147 @@ def getnegfrombatch_bert(oneindex,firstent,firstentindex,secondent,secondentinde
 
     return np.asarray(negres),np.asarray(maskres),np.asarray(headidres),np.asarray(tailidres)
 
+def getnegfrombatch_bert(oneindex,firstent,firstentindex,secondent,secondentindex,headid,tailid,sentences,lengths,getnegfromnum,allnum,labels,neg_labels,config):
+    thissentence = sentences[oneindex].cpu().numpy().tolist()
+    thislength = lengths[oneindex]
+    thisfirstent = firstent[oneindex]
+    thisfirstentindex = firstentindex[oneindex].numpy().tolist()
+    headstart = thisfirstentindex[0]
+    headend = thisfirstentindex[-1]
+    posheadlength = len(thisfirstentindex)
 
+    thisheadid = headid[oneindex]
+
+    thissecondent = secondent[oneindex]
+    thissecondentindex = secondentindex[oneindex].numpy().tolist()
+    tailstart = thissecondentindex[0]
+    tailend = thissecondentindex[-1]
+    postaillength = len(thissecondentindex)
+
+    thistailid = tailid[oneindex]
+
+    negres = []
+    maskres = []
+    headidres=[]
+    tailidres=[]
+
+    for j in range(getnegfromnum):
+        touseindex = (oneindex + j + 1) % allnum
+        negusehead = firstent[touseindex].numpy().tolist()
+        negheadlength = len(negusehead)
+        negusetail = secondent[touseindex].numpy().tolist()
+        negtaillength = len(negusetail)
+        negsamplechangehead = thissentence[0:headstart] + negusehead + thissentence[headend + 1:]
+        changeheadlength = thislength - posheadlength + negheadlength
+        if len(negsamplechangehead) > config["max_length"]:
+            negsamplechangehead = negsamplechangehead[0:config["max_length"]]
+        for i in range(len(negsamplechangehead), config["max_length"]):
+            negsamplechangehead.append(0)
+        mask1 = []
+        for i in range(0, changeheadlength):
+            mask1.append(1)
+        for i in range(changeheadlength, config["max_length"]):
+            mask1.append(0)
+        if len(mask1) > config["max_length"]:
+            mask1 = mask1[0:config["max_length"]]
+
+        negsamplechangetail = thissentence[0:tailstart] + negusetail + thissentence[tailend + 1:]
+        changetaillength = thislength - postaillength + negtaillength
+        if len(negsamplechangetail) > config["max_length"]:
+            negsamplechangetail = negsamplechangetail[0:config["max_length"]]
+        for i in range(len(negsamplechangetail), config["max_length"]):
+            negsamplechangetail.append(0)
+        mask2 = []
+        for i in range(0, changetaillength):
+            mask2.append(1)
+        for i in range(changetaillength, config["max_length"]):
+            mask2.append(0)
+        if len(mask2) > config["max_length"]:
+            mask2 = mask2[0:config["max_length"]]
+
+        if len(mask1) != len(mask2):
+            print(len(mask1))
+            print(len(mask2))
+            print(mask1)
+            print(mask2)
+
+        negres.append(negsamplechangehead)
+        maskres.append(mask1)
+        # headidres.append(thisheadid)
+        # tailidres.append(min(thistailid- posheadlength + negheadlength, config["max_length"]))
+
+        # tailid might be smaller than headid
+        if thisheadid < thistailid:
+            headidres.append(thisheadid)
+            tailidres.append(min(thistailid - posheadlength + negheadlength, config["max_length"]))
+        else:
+            headidres.append(thisheadid)
+            tailidres.append(thistailid)
+
+        negres.append(negsamplechangetail)
+        maskres.append(mask2)
+        # headidres.append(thisheadid)
+        # tailidres.append(thistailid)
+        if thisheadid < thistailid:
+            headidres.append(thisheadid)
+            tailidres.append(thistailid)
+        else:
+            tailidres.append(thistailid)
+            headidres.append(min(thisheadid - postaillength + negtaillength, config["max_length"]))
+
+
+
+    return np.asarray(negres),np.asarray(maskres),np.asarray(headidres),np.asarray(tailidres)
+def getnegfrombatch_bert_new(oneindex,firstent,firstentindex,secondent,secondentindex,headid,tailid,sentences,lengths,getnegfromnum,allnum,labels,neg_labels,config,sp_token):
+    thissentence = sentences[oneindex].cpu().numpy().tolist()
+    thislength = lengths[oneindex]
+    thisfirstent = firstent[oneindex]
+    thisfirstentindex = firstentindex[oneindex].numpy().tolist()
+    headstart = thisfirstentindex[0]
+    headend = thisfirstentindex[-1]
+    posheadlength = len(thisfirstentindex)
+
+    thisheadid = headid[oneindex]
+
+    thissecondent = secondent[oneindex]
+    thissecondentindex = secondentindex[oneindex].numpy().tolist()
+    tailstart = thissecondentindex[0]
+    tailend = thissecondentindex[-1]
+    postaillength = len(thissecondentindex)
+
+    thistailid = tailid[oneindex]
+
+    negres = []
+    maskres = []
+    headidres=[]
+    tailidres=[]
+    #
+    head_mask_length = int(0.5 * posheadlength) + 1
+    tail_mask_length = int(0.5 * postaillength) + 1
+    for j in range(getnegfromnum):
+        negsamplechangehead = thissentence[0:headstart] + [sp_token] * head_mask_length + thissentence[headstart + head_mask_length  : ]
+        negsamplechangetail = thissentence[0:tailstart] + [sp_token] * tail_mask_length + thissentence[tailstart + tail_mask_length  : ]
+        # negsamplechangehead = thissentence[0:headstart] + [sp_token] * posheadlength + thissentence[headend + 1  : ]
+        # negsamplechangetail = thissentence[0:tailstart] + [sp_token] * postaillength + thissentence[tailend + 1  : ]
+        # negsamplechangehead , negsamplechangetail = thissentence, thissentence
+        # negsamplechangehead[headstart : headstart + head_mask_length] = [sp_token] * head_mask_length
+        # negsamplechangetail[tailstart : tailstart + tail_mask_length] = [sp_token] * tail_mask_length
+        mask1 = []
+        for i in range(0, thislength):
+            mask1.append(1)
+        for i in range(thislength, config["max_length"]):
+            mask1.append(0)
+        negres.append(negsamplechangehead)
+        maskres.append(mask1)
+        headidres.append(thisheadid)
+        tailidres.append(thistailid)
+
+        negres.append(negsamplechangetail)
+        maskres.append(mask1)
+        headidres.append(thisheadid)
+        tailidres.append(thistailid)
+
+    return np.asarray(negres),np.asarray(maskres),np.asarray(headidres),np.asarray(tailidres)
 def generate_neg_samples_bert(oneindex,firstent,firstentindex,secondent,secondentindex,headid,tailid,sentences,lengths,neg_num,allnum,labels,neg_labels,config, epoch_i, head_flag_list_all, touseindex_list_all):
     # random.seed(seed)
     thissentence = sentences[oneindex].cpu().numpy().tolist()
@@ -226,7 +366,8 @@ def infonce_loss(query, pos_emb, neg_emb, temp=0.1, reduction='mean', type='mem'
         labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
         return F.cross_entropy(logits / temp, labels, reduction=reduction)
     else:
-        negative_logits[abs(negative_logits) < threshold] = -1e9
+        # negative_logits[abs(negative_logits) < threshold] = -1e9
+        negative_logits[negative_logits < threshold] = -1e9
         logits = torch.cat([positive_logit, negative_logits], dim=1)
         labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
         return F.cross_entropy(logits / temp, labels, reduction=reduction)
